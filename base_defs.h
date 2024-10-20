@@ -24,6 +24,8 @@ typedef struct {
     u64 size;
 } string8;
 
+#define STR8_LIT(s) (string8){ (u8*)s, sizeof(s) - 1 }
+
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
 #define CLAMP(x, a, b) (MIN((b), MAX((a), (x))))
