@@ -37,6 +37,7 @@ typedef struct {
 #define GiB(x) ((u64)x << 30)
 
 #define ROUND_UP_POW2(n, b) (((u64)(n) + ((u64)(b) - 1)) & (~((u64)(b) - 1)))
+#define ROUND_DOWN_POW2(n, b) ((u64)(n) & (~((u64)(b) - 1)))
 
 #endif // BASE_DEFS_H
 

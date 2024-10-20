@@ -1,11 +1,14 @@
-#include <signal.h>
-#include <unistd.h>
-#include <termios.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
+#include <stdarg.h>
+
 #include <sys/mman.h>
 #include <sys/ioctl.h>
+
+#include <signal.h>
+#include <unistd.h>
+#include <termios.h>
 
 #include "base_defs.h"
 #include "config.h"
@@ -38,7 +41,6 @@ typedef struct {
 
     u8* file_data;
     u32 file_size;
-    u32 file_max_size;
 
     u32 num_lines;
 
@@ -49,6 +51,7 @@ typedef struct {
 } file_context;
 
 static void fatal_error(string8 msg);
+static void debug_msgf(const char* fmt, ...);
 
 void* mem_reserve(u64 size);
 b32 mem_commit(void* ptr, u64 size);
@@ -62,11 +65,14 @@ void enter_raw_mode(void);
 file_context* fc_open(const char* file_name);
 void fc_close(file_context* fc);
 void fc_expand(file_context* fc, u32 amount);
+b32 fc_shrink(file_context* fc, u32 amount);
 void fc_draw(file_context* fc);
 void fc_scroll(file_context* fc, i32 amount);
 void fc_move_cursor_y(file_context* fc, i32 amount);
 void fc_move_cursor_x(file_context* fc, i32 amount);
+// Inserts or removes at cursor
 void fc_insert_char(file_context* fc, u8 c);
+void fc_remove_char(file_context* fc);
 
 static u8* draw_buf = NULL;
 
@@ -139,6 +145,14 @@ int main(int argc, char** argv) {
                         fc_move_cursor_x(fc, 1);
                         break;
 
+                    case '0':
+                        fc_move_cursor_x(fc, -fc->cursor_col);
+                        break;
+
+                    case 'x':
+                        fc_remove_char(fc);
+                        break;
+
                     case 'q':
                         running = false;
                         break;
@@ -173,17 +187,22 @@ int main(int argc, char** argv) {
     return 0;
 }
 
-static void fatal_error(string8 msg) {
+static void _display_win(string8 title, string8 msg, string8 footer, u32 draw_start, u32 buf_pos) {
+    string8 empty = STR8_LIT("");
     string8 lines[] = {
-        STR8_LIT(""),
-        STR8_LIT("Fatal Error"),
-        STR8_LIT(""),
+        empty,
+        title,
+        empty,
         msg,
-        STR8_LIT(""),
-        STR8_LIT("Press any key to quit"),
-        STR8_LIT(""),
+        empty,
+        footer,
+        empty,
     };
     u32 num_lines = sizeof(lines) / sizeof(lines[0]);
+
+    if (footer.size == 0) {
+        num_lines -= 2;
+    }
 
     // +1 is because the topleft is (1, 1)
     u32 center_x = editor.term_cols / 2 + 1;
@@ -201,11 +220,6 @@ static void fatal_error(string8 msg) {
     u32 start_row = center_y - height / 2;
     u32 start_col = center_x - width / 2;
 
-    u32 buf_pos = 0;
-
-    // Red bg, white fg
-    DRAW_BUF_APPEND_STR("\x1b[41m\x1b[97m");
-
     for (u32 i = 0; i < num_lines; i++) {
         set_cursor_pos(&buf_pos, start_row + i, start_col);
 
@@ -218,15 +232,73 @@ static void fatal_error(string8 msg) {
         for (u32 j = 0; j < pad_right; j++) { DRAW_BUF_APPEND(&c, 1); }
     }
 
-    write(STDOUT_FILENO, draw_buf, buf_pos);
+    // Clear any colors
+    DRAW_BUF_APPEND_STR("\x1b[0m");
 
-    // Wait for key
+    write(STDOUT_FILENO, draw_buf + draw_start, buf_pos - draw_start);
+}
+
+static void fatal_error(string8 msg) {
+    u32 buf_pos = 0;
+
+    // Red bg, white fg
+    DRAW_BUF_APPEND_STR("\x1b[41m\x1b[97m");
+
+    _display_win(
+        STR8_LIT("Fatal Error"),
+        msg,
+        STR8_LIT("Press enter to quit"),
+        0, buf_pos
+    );
+
+    // Wait for enter key
     u8 c = 0;
-    read(STDIN_FILENO, &c, 1);
+    while (c != '\r') {
+        read(STDIN_FILENO, &c, 1);
+    }
 
     write(STDOUT_FILENO, "\x1b[0m\x1b[2J\x1b[H", 11);
     exit_raw_mode();
     exit(1);
+}
+static void debug_msgf(const char* fmt, ...) {
+#ifdef DEBUG
+    va_list args = { 0 };
+    va_start(args, fmt);
+
+    // I am putting the formatted string into the draw buffer,
+    // but not actually writting it to stdout
+    // (I just needed some memory)
+
+    i32 str_size = vsnprintf((char*)draw_buf, DRAW_BUF_SIZE, fmt, args);
+
+    va_end(args);
+
+    if (str_size < 0) {
+        return;
+    }
+
+    string8 msg = { .data = draw_buf, .size = str_size };
+
+    u32 draw_start = str_size;
+    u32 buf_pos = str_size;
+
+    // Magenta bg, white fg
+    DRAW_BUF_APPEND_STR("\x1b[45m\x1b[97m");
+
+    _display_win(
+        STR8_LIT("Debug Message"),
+        msg,
+        STR8_LIT("Press enter to close"),
+        draw_start, buf_pos
+    );
+
+    // Wait for enter key
+    u8 c = 0;
+    while (c != '\r') {
+        read(STDIN_FILENO, &c, 1);
+    }
+#endif
 }
 
 // TODO: automatically update the display when this happens
@@ -351,11 +423,10 @@ file_context* fc_open(const char* file_name) {
 
     file_context* out = (file_context*)mem;
     out->mem = mem;
-    out->mem_pos = sizeof(file_context);
+    out->mem_pos = sizeof(file_context) + file_size;
     out->reserve_size = FILE_MAX_SIZE;
     out->commit_size = commit_size;
-    out->file_data = out->mem + out->mem_pos;
-    out->file_max_size = FILE_MAX_SIZE - out->mem_pos;
+    out->file_data = out->mem + sizeof(file_context);
     out->file_size = file_size;
 
     out->row_offset = 0;
@@ -377,6 +448,7 @@ file_context* fc_open(const char* file_name) {
 
     fclose(f);
 
+    out->num_lines = 1;
     u32 file_pos = 0;
     while (file_pos < out->file_size) {
         u32 line_size = _get_next_line_size(out->file_data, file_pos, out->file_size);
@@ -402,10 +474,43 @@ void fc_close(file_context* fc) {
 }
 
 void fc_expand(file_context* fc, u32 amount) {
+    if (fc->mem_pos + amount > fc->reserve_size) {
+        printf("\x1b[H%lu %u %lu\n", fc->mem_pos, amount, fc->reserve_size);
+        fatal_error(STR8_LIT("Out of file memory; Try changing FILE_MAX_SIZE in config.h"));
+    }
+
     if (fc->mem_pos + amount > fc->commit_size) {
+        u32 new_commit = ROUND_UP_POW2(amount, FILE_COMMIT_SIZE);
+
+        if (mem_commit(fc->mem + fc->commit_size, new_commit) == false) {
+            fatal_error(STR8_LIT("Unable to commit memory for file"));
+        }
+
+        fc->commit_size += new_commit;
     }
 
     fc->mem_pos += amount;
+    fc->file_size += amount;
+}
+b32 fc_shrink(file_context* fc, u32 amount) {
+    if (amount > fc->file_size) {
+        return false;
+    }
+
+    if (fc->commit_size - (fc->mem_pos - amount) > FILE_COMMIT_SIZE) {
+        u32 decommit_size = ROUND_DOWN_POW2(fc->mem_pos - amount, FILE_COMMIT_SIZE);
+
+        if (mem_decommit(fc->mem + fc->commit_size - decommit_size, decommit_size) == false) {
+            fatal_error(STR8_LIT("Unable to decommit memory for file"));
+        }
+
+        fc->commit_size -= decommit_size;
+    }
+
+    fc->mem_pos -= amount;
+    fc->file_size -= amount;
+
+    return true;
 }
 
 // TODO: Not always draw the entire screen?
@@ -506,6 +611,10 @@ u32 _get_cur_row_pos(const file_context* fc) {
     return file_pos;
 }
 
+u32 _get_cur_pos(const file_context* fc) {
+    return _get_cur_row_pos(fc) + fc->cursor_col;
+}
+
 void fc_scroll(file_context* fc, i32 amount) {
     fc->row_offset = CLAMP(fc->row_offset + amount, 0, (i32)fc->num_lines - 2);
     fc->cursor_row = CLAMP(
@@ -545,6 +654,30 @@ void fc_move_cursor_x(file_context* fc, i32 amount) {
     }
 }
 void fc_insert_char(file_context* fc, u8 c) {
+    u32 file_pos = _get_cur_pos(fc);
+
+    fc_expand(fc, 1);
+
+    for (u32 i = fc->file_size - 1; i > file_pos; i--) {
+        fc->file_data[i] = fc->file_data[i-1];
+    }
+
+    fc->file_data[file_pos] = c;
+    fc->cursor_col += 1;
+}
+void fc_remove_char(file_context* fc) {
+    if (fc->file_size == 0) { return; }
+
+    u32 file_pos = _get_cur_pos(fc);
+
+    for (u32 i = file_pos; i < fc->file_size - 1; i++) {
+        fc->file_data[i] = fc->file_data[i+1];
+    }
+
+    fc_shrink(fc, 1);
+
+    // Update cursor x if width of the new line is different
+    fc_move_cursor_x(fc, 0);
 }
 
 void set_cursor_pos(u32* draw_buf_pos, i32 row, i32 col) {
